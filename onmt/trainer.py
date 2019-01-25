@@ -226,8 +226,7 @@ class Trainer(object):
                 outputs, attns = self.model(src, tgt, src_lengths)
 
                 # Compute loss.
-                batch_stats = self.valid_loss.monolithic_compute_loss(
-                    batch, outputs, attns)
+                _, batch_stats = self.valid_loss(batch, outputs, attns)
 
                 # Update statistics.
                 stats.update(batch_stats)
@@ -251,6 +250,8 @@ class Trainer(object):
                 trunc_size = target_size
 
             src, src_lengths = inputters.make_features(batch, 'src')
+            if src_lengths is not None:
+                report_stats.n_src_words += src_lengths.sum().item()
 
             # this method unsqueezes its input
             tgt_outer, _ = inputters.make_features(batch, 'tgt')
@@ -266,10 +267,16 @@ class Trainer(object):
                 outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
                 bptt = True
 
-                # 3. Compute loss in shards for memory efficiency.
-                batch_stats = self.train_loss.sharded_compute_loss(
-                    batch, outputs, attns, j,
-                    trunc_size, self.shard_size, normalization)
+                # 3. Compute loss.
+                loss, batch_stats = self.train_loss(
+                    batch,
+                    outputs,
+                    attns,
+                    normalization=normalization,
+                    shard_size=self.shard_size,
+                    trunc_start=j,
+                    trunc_size=trunc_size)
+                loss.backward()
                 total_stats.update(batch_stats)
                 report_stats.update(batch_stats)
 
