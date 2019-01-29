@@ -5,6 +5,7 @@ import configargparse
 import codecs
 import os
 import math
+import time
 
 import torch
 
@@ -109,6 +110,7 @@ class Translator(object):
         self.verbose = opt.verbose
         self.report_bleu = opt.report_bleu
         self.report_rouge = opt.report_rouge
+        self.report_time = opt.report_time
         self.fast = opt.fast
 
         self.copy_attn = model_opt.copy_attn
@@ -131,6 +133,12 @@ class Translator(object):
                 "log_probs": []}
 
         set_random_seed(opt.seed, self.cuda)
+
+    def _log(self, msg):
+        if self.logger:
+            self.logger.info(msg)
+        else:
+            print(msg)
 
     def translate(
         self,
@@ -205,6 +213,8 @@ class Translator(object):
         all_scores = []
         all_predictions = []
 
+        start_time = time.time()
+
         for batch in data_iter:
             batch_data = self.translate_batch(
                 batch, data, attn_debug, fast=self.fast
@@ -254,6 +264,8 @@ class Translator(object):
                         row_format = "{:>10.10} " + "{:>10.7f} " * len(srcs)
                     os.write(1, output.encode('utf-8'))
 
+        end_time = time.time()
+
         if self.report_score:
             msg = self._report_score('PRED', pred_score_total,
                                      pred_words_total)
@@ -280,6 +292,14 @@ class Translator(object):
                         self.logger.info(msg)
                     else:
                         print(msg)
+
+        if self.report_time:
+            total_time = end_time - start_time
+            self._log("Total translation time (s): %f" % total_time)
+            self._log("Average translation time (s): %f" % (
+                total_time / len(all_predictions)))
+            self._log("Tokens per second: %f" % (
+                pred_words_total / total_time))
 
         if self.dump_beam:
             import json
@@ -330,7 +350,7 @@ class Translator(object):
 
         batch_size = batch.batch_size
 
-        tgt_field = self.fields['tgt'][0][1]
+        tgt_field = self.fields['tgt'][0][1].base_field
         vocab = tgt_field.vocab
 
         start_token = vocab.stoi[tgt_field.init_token]
@@ -458,7 +478,8 @@ class Translator(object):
                 return self._translate_batch(batch, data)
 
     def _run_encoder(self, batch):
-        src, src_lengths = inputters.make_features(batch, 'src')
+        src, src_lengths = batch.src if isinstance(batch.src, tuple) \
+                           else (batch.src, None)
 
         enc_states, memory_bank, src_lengths = self.model.encoder(
             src, src_lengths)
@@ -483,7 +504,7 @@ class Translator(object):
         batch_offset=None
     ):
 
-        tgt_field = self.fields["tgt"][0][1]
+        tgt_field = self.fields["tgt"][0][1].base_field
         unk_idx = tgt_field.vocab.stoi[tgt_field.unk_token]
         if self.copy_attn:
             # Turn any copied words into UNKs.
@@ -546,7 +567,7 @@ class Translator(object):
 
         beam_size = self.beam_size
         batch_size = batch.batch_size
-        tgt_field = self.fields['tgt'][0][1]
+        tgt_field = self.fields['tgt'][0][1].base_field
         vocab = tgt_field.vocab
         start_token = vocab.stoi[tgt_field.init_token]
         end_token = vocab.stoi[tgt_field.eos_token]
@@ -740,7 +761,7 @@ class Translator(object):
         # And helper method for reducing verbosity.
         beam_size = self.beam_size
         batch_size = batch.batch_size
-        tgt_field = self.fields['tgt'][0][1]
+        tgt_field = self.fields['tgt'][0][1].base_field
         vocab = tgt_field.vocab
 
         # Define a set of tokens to exclude from ngram-blocking
@@ -836,17 +857,17 @@ class Translator(object):
         return results
 
     def _score_target(self, batch, memory_bank, src_lengths, data, src_map):
-        tgt, _ = inputters.make_features(batch, 'tgt')
+        tgt = batch.tgt
         tgt_in = tgt[:-1]
 
         log_probs, attn = self._decode_and_generate(
             tgt_in, memory_bank, batch, data,
             memory_lengths=src_lengths, src_map=src_map)
-        tgt_field = self.fields["tgt"][0][1]
+        tgt_field = self.fields["tgt"][0][1].base_field
         tgt_pad = tgt_field.vocab.stoi[tgt_field.pad_token]
 
         log_probs[:, :, tgt_pad] = 0
-        gold = batch.tgt[1:].unsqueeze(2)
+        gold = tgt_in
         gold_scores = log_probs.gather(2, gold)
         gold_scores = gold_scores.sum(dim=0).view(-1)
 
