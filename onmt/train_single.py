@@ -148,7 +148,12 @@ def main(opt, device_id):
         logger.info('Starting training on GPU: %s' % opt.gpu_ranks)
     else:
         logger.info('Starting training on CPU, could be very slow')
-    trainer.train(train_iter, valid_iter, opt.train_steps, opt.valid_steps)
+    trainer.train(
+        train_iter,
+        opt.train_steps,
+        save_checkpoint_steps=opt.save_checkpoint_steps,
+        valid_iter=valid_iter,
+        valid_steps=opt.valid_steps)
 
     if opt.tensorboard:
         trainer.report_manager.tensorboard_writer.close()
