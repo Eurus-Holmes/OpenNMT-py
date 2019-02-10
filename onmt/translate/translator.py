@@ -58,14 +58,12 @@ class Translator(object):
        model (:obj:`onmt.modules.NMTModel`):
           NMT model to use for translation
        fields (dict of Fields): data fields
-       beam_size (int): size of beam to use
-       n_best (int): number of translations produced
-       max_length (int): maximum length output to produce
+       opt (obj): command line options
+       model_opt (obj): model options
        global_scores (:obj:`GlobalScorer`):
          object to rescore final translations
-       copy_attn (bool): use copy attention during translation
-       cuda (bool): use cuda
-       beam_trace (bool): trace beam search for debugging
+       out_file : Output File
+       report_score (bool) : Whether to report scores
        logger(logging.Logger): logger.
     """
 
@@ -106,6 +104,7 @@ class Translator(object):
 
         self.min_length = opt.min_length
         self.stepwise_penalty = opt.stepwise_penalty
+        self.coverage_penalty = opt.coverage_penalty
         self.dump_beam = opt.dump_beam
         self.block_ngram_repeat = opt.block_ngram_repeat
         self.ignore_when_blocking = set(opt.ignore_when_blocking)
@@ -119,7 +118,6 @@ class Translator(object):
         self.report_bleu = opt.report_bleu
         self.report_rouge = opt.report_rouge
         self.report_time = opt.report_time
-        self.fast = opt.fast
 
         self.copy_attn = model_opt.copy_attn
 
@@ -129,6 +127,7 @@ class Translator(object):
         self.logger = logger
 
         self.use_filter_pred = False
+        self._filter_pred = None
 
         # for debugging
         self.beam_trace = self.dump_beam != ""
@@ -183,15 +182,14 @@ class Translator(object):
         if batch_size is None:
             raise ValueError("batch_size must be set")
 
-        data = inputters.build_dataset(
+        data = inputters.Dataset(
             self.fields,
-            self.data_type,
-            src=src,
-            src_reader=self.src_reader,
-            tgt=tgt,
-            tgt_reader=self.tgt_reader,
-            src_dir=src_dir,
-            use_filter_pred=self.use_filter_pred,
+            readers=([self.src_reader, self.tgt_reader]
+                     if tgt else [self.src_reader]),
+            data=[("src", src), ("tgt", tgt)] if tgt else [("src", src)],
+            dirs=[src_dir, None] if tgt else [src_dir],
+            sort_key=inputters.str2sortkey[self.data_type],
+            filter_pred=self._filter_pred
         )
 
         cur_device = "cuda" if self.cuda else "cpu"
@@ -222,7 +220,7 @@ class Translator(object):
 
         for batch in data_iter:
             batch_data = self.translate_batch(
-                batch, data.src_vocabs, attn_debug, fast=self.fast
+                batch, data.src_vocabs, attn_debug
             )
             translations = builder.from_batch(batch_data)
 
@@ -432,7 +430,7 @@ class Translator(object):
 
         return results
 
-    def translate_batch(self, batch, src_vocabs, attn_debug, fast=False):
+    def translate_batch(self, batch, src_vocabs, attn_debug):
         """
         Translate a batch of sentences.
 
@@ -441,7 +439,6 @@ class Translator(object):
         Args:
            batch (:obj:`Batch`): a batch from a dataset object
            data (:obj:`Dataset`): the dataset object
-           fast (bool): enables fast beam search (may not support all features)
         """
         with torch.no_grad():
             if self.beam_size == 1:
@@ -453,16 +450,14 @@ class Translator(object):
                     sampling_temp=self.random_sampling_temp,
                     keep_topk=self.sample_from_topk,
                     return_attention=attn_debug or self.replace_unk)
-            if fast:
-                return self._fast_translate_batch(
+            else:
+                return self._translate_batch(
                     batch,
                     src_vocabs,
                     self.max_length,
                     min_length=self.min_length,
                     n_best=self.n_best,
                     return_attention=attn_debug or self.replace_unk)
-            else:
-                return self._translate_batch(batch, src_vocabs)
 
     def _run_encoder(self, batch):
         src, src_lengths = batch.src if isinstance(batch.src, tuple) \
@@ -534,7 +529,7 @@ class Translator(object):
             # or [ tgt_len, batch_size, vocab ] when full sentence
         return log_probs, attn
 
-    def _fast_translate_batch(
+    def _translate_batch(
         self,
         batch,
         src_vocabs,
@@ -545,7 +540,6 @@ class Translator(object):
     ):
         # TODO: support these blacklisted features.
         assert not self.dump_beam
-        assert self.global_scorer.beta == 0
 
         # (0) Prep the components of the search.
         use_src_map = self.copy_attn
@@ -601,6 +595,7 @@ class Translator(object):
             max_length=max_length,
             mb_device=mb_device,
             return_attention=return_attention,
+            stepwise_penalty=self.stepwise_penalty,
             block_ngram_repeat=self.block_ngram_repeat,
             exclusion_tokens=self._exclusion_idxs,
             memory_lengths=memory_lengths)
@@ -616,7 +611,7 @@ class Translator(object):
                 memory_lengths=memory_lengths,
                 src_map=src_map,
                 step=step,
-                batch_offset=beam.batch_offset
+                batch_offset=beam._batch_offset
             )
 
             beam.advance(log_probs, attn)
@@ -649,7 +644,8 @@ class Translator(object):
         results["attention"] = beam.attention
         return results
 
-    def _translate_batch(self, batch, src_vocabs):
+    # This is left in the code for now, but unsued
+    def _translate_batch_deprecated(self, batch, src_vocabs):
         # (0) Prep each of the components of the search.
         # And helper method for reducing verbosity.
         use_src_map = self.copy_attn
@@ -723,8 +719,9 @@ class Translator(object):
             select_indices_array = []
             # Loop over the batch_size number of beam
             for j, b in enumerate(beam):
-                b.advance(out[j, :],
-                          beam_attn.data[j, :, :memory_lengths[j]])
+                if not b.done:
+                    b.advance(out[j, :],
+                              beam_attn.data[j, :, :memory_lengths[j]])
                 select_indices_array.append(
                     b.current_origin + j * beam_size)
             select_indices = torch.cat(select_indices_array)

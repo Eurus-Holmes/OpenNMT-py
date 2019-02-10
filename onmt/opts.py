@@ -65,6 +65,9 @@ def model_opts(parser):
               help="""Type of source model to use. Allows
                        the system to incorporate non-text inputs.
                        Options are [text|img|audio].""")
+    group.add('--model_dtype', '-model_dtype', default='fp32',
+              choices=['fp32', 'fp16'],
+              help='Data type of the model.')
 
     group.add('--encoder_type', '-encoder_type', type=str, default='rnn',
               choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn'],
@@ -168,6 +171,9 @@ def model_opts(parser):
               help='Train a coverage attention layer.')
     group.add('--lambda_coverage', '-lambda_coverage', type=float, default=1,
               help='Lambda value for coverage.')
+    group.add('--loss_scale', '-loss_scale', type=float, default=0,
+              help="""For FP16 training, the static loss scale to use. If not
+                      set, the loss scale is dynamically computed.""")
 
 
 def preprocess_opts(parser):
@@ -176,7 +182,7 @@ def preprocess_opts(parser):
     group = parser.add_argument_group('Data')
     group.add('--data_type', '-data_type', default="text",
               help="""Type of the source input.
-                       Options are [text|img].""")
+                       Options are [text|img|audio].""")
 
     group.add('--train_src', '-train_src', required=True,
               help="Path to the training source data")
@@ -388,11 +394,13 @@ def train_opts(parser):
                         uses more memory. Set to 0 to disable.""")
     group.add('--train_steps', '-train_steps', type=int, default=100000,
               help='Number of training steps')
+    group.add('--single_pass', '-single_pass', action='store_true',
+              help="Make a single pass over the training dataset.")
     group.add('--epochs', '-epochs', type=int, default=0,
               help='Deprecated epochs see train_steps')
     group.add('--optim', '-optim', default='sgd',
               choices=['sgd', 'adagrad', 'adadelta', 'adam',
-                       'sparseadam', 'adafactor'],
+                       'sparseadam', 'adafactor', 'fusedadam'],
               help="""Optimization method.""")
     group.add('--adagrad_accumulator_init', '-adagrad_accumulator_init',
               type=float, default=0,
@@ -433,6 +441,18 @@ def train_opts(parser):
                        Set to zero to turn off label smoothing.
                        For more detailed information, see:
                        https://arxiv.org/abs/1512.00567""")
+    group.add('--average_decay', '-average_decay', type=float, default=0,
+              help="""Moving average decay.
+                      Set to other than 0 (e.g. 1e-4) to activate.
+                      Similar to Marian NMT implementation:
+                      http://www.aclweb.org/anthology/P18-4020
+                      For more detail on Exponential Moving Average:
+                      https://en.wikipedia.org/wiki/Moving_average""")
+    group.add('--average_every', '-average_every', type=int, default=1,
+              help="""Step for moving average.
+                      Default is every update,
+                      if -average_decay is set.""")
+
     # learning rate
     group = parser.add_argument_group('Optimization- Rate')
     group.add('--learning_rate', '-learning_rate', type=float, default=1.0,
@@ -563,9 +583,6 @@ def translate_opts(parser):
               help="Random seed")
 
     group = parser.add_argument_group('Beam')
-    group.add('--fast', '-fast', action="store_true",
-              help="""Use fast beam search (some features may not be
-                       supported!)""")
     group.add('--beam_size', '-beam_size', type=int, default=5,
               help='Beam size')
     group.add('--min_length', '-min_length', type=int, default=0,

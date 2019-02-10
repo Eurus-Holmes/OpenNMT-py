@@ -6,17 +6,15 @@ import math
 
 from collections import Counter, defaultdict
 from itertools import chain, cycle
-from functools import partial
 
 import torch
 import torchtext.data
 from torchtext.data import Field
 from torchtext.vocab import Vocab
 
-from onmt.inputters.text_dataset import TextDataset, text_fields,\
-    TextMultiField
-from onmt.inputters.image_dataset import ImageDataset, image_fields
-from onmt.inputters.audio_dataset import AudioDataset, audio_fields
+from onmt.inputters.text_dataset import text_fields, TextMultiField
+from onmt.inputters.image_dataset import image_fields
+from onmt.inputters.audio_dataset import audio_fields
 from onmt.utils.logging import logger
 # backwards compatibility
 from onmt.inputters.text_dataset import _feature_tokenize  # noqa: F401
@@ -248,52 +246,6 @@ def filter_example(ex, use_src_len=True, use_tgt_len=True,
         (not use_tgt_len or min_tgt_len <= tgt_len <= max_tgt_len)
 
 
-def build_dataset(fields, data_type, src, src_reader,
-                  src_dir=None, tgt=None, tgt_reader=None,
-                  src_seq_len=50, tgt_seq_len=50, use_filter_pred=True):
-    """Create a dataset from data on disk.
-
-    Args:
-        fields (dict[str, List[Tuple[str, Field]]]): A dict with top-level
-            keys for the sides (e.x., ``'src'``, ``'tgt'``) mapping to
-            lists of (name, Field) pairs.
-        data_type (str): A supported datatype.
-        src: See :func:`src_reader.read()` for details.
-        src_reader (onmt.inputters.DataReaderBase): The disk-to-dict
-            reader for src data.
-        src_dir: See :func:`src_reader.read()` for details.
-        tgt: See :func:`tgt_reader.read()` for details.
-        tgt_reader (onmt.inputters.TextDataReader): Similar to above.
-        src_seq_len: Max acceptable src sequence length. See
-            :func:`filter_example()` for details.
-        tgt_seq_len: Similar to above.
-        use_filter_pred (bool): Whether or not to apply length filtering.
-    """
-
-    dataset_classes = {
-        'text': TextDataset, 'img': ImageDataset, 'audio': AudioDataset
-    }
-    assert data_type in dataset_classes
-    assert src is not None
-
-    # the second conjunct means nothing will be filtered at translation time
-    # if there is no target data
-    if use_filter_pred and tgt is not None:
-        filter_pred = partial(
-            filter_example, use_src_len=data_type == 'text',
-            max_src_len=src_seq_len, max_tgt_len=tgt_seq_len
-        )
-    else:
-        filter_pred = None
-
-    return dataset_classes[data_type](
-        fields,
-        readers=[src_reader, tgt_reader] if tgt else [src_reader],
-        data=[("src", src), ("tgt", tgt)] if tgt else [("src", src)],
-        dirs=[src_dir, None] if tgt else [src_dir],
-        filter_pred=filter_pred)
-
-
 def _pad_vocab_to_multiple(vocab, multiple):
     vocab_size = len(vocab)
     if vocab_size % multiple == 0:
@@ -483,23 +435,69 @@ def _read_vocab_file(vocab_path, tag):
             return [line.strip().split()[0] for line in f if line.strip()]
 
 
+def batch_iter(data, batch_size, batch_size_fn=None, batch_size_multiple=1):
+    """Yield elements from data in chunks of batch_size, where each chunk size
+    is a multiple of batch_size_multiple.
+
+    This is an extended version of torchtext.data.batch.
+    """
+    if batch_size_fn is None:
+        def batch_size_fn(new, count, sofar):
+            return count
+    minibatch, size_so_far = [], 0
+    for ex in data:
+        minibatch.append(ex)
+        size_so_far = batch_size_fn(ex, len(minibatch), size_so_far)
+        if size_so_far >= batch_size:
+            overflowed = 0
+            if size_so_far > batch_size:
+                overflowed += 1
+            if batch_size_multiple > 1:
+                overflowed += (
+                    (len(minibatch) - overflowed) % batch_size_multiple)
+            if overflowed == 0:
+                yield minibatch
+                minibatch, size_so_far = [], 0
+            else:
+                yield minibatch[:-overflowed]
+                minibatch = minibatch[-overflowed:]
+                size_so_far = 0
+                for i, ex in enumerate(minibatch):
+                    size_so_far = batch_size_fn(ex, i + 1, size_so_far)
+    if minibatch:
+        yield minibatch
+
+
 class OrderedIterator(torchtext.data.Iterator):
+
+    def __init__(self,
+                 dataset,
+                 batch_size,
+                 batch_size_multiple=1,
+                 **kwargs):
+        super(OrderedIterator, self).__init__(dataset, batch_size, **kwargs)
+        self.batch_size_multiple = batch_size_multiple
 
     def create_batches(self):
         if self.train:
             def _pool(data, random_shuffler):
                 for p in torchtext.data.batch(data, self.batch_size * 100):
-                    p_batch = torchtext.data.batch(
+                    p_batch = batch_iter(
                         sorted(p, key=self.sort_key),
-                        self.batch_size, self.batch_size_fn)
+                        self.batch_size,
+                        batch_size_fn=self.batch_size_fn,
+                        batch_size_multiple=self.batch_size_multiple)
                     for b in random_shuffler(list(p_batch)):
                         yield b
 
             self.batches = _pool(self.data(), self.random_shuffler)
         else:
             self.batches = []
-            for b in torchtext.data.batch(self.data(), self.batch_size,
-                                          self.batch_size_fn):
+            for b in batch_iter(
+                    self.data(),
+                    self.batch_size,
+                    batch_size_fn=self.batch_size_fn,
+                    batch_size_multiple=self.batch_size_multiple):
                 self.batches.append(sorted(b, key=self.sort_key))
 
 
@@ -517,38 +515,64 @@ class DatasetLazyIter(object):
     """
 
     def __init__(self, dataset_paths, fields, batch_size, batch_size_fn,
-                 device, is_train):
+                 batch_size_multiple, device, is_train, repeat=True,
+                 num_batches_multiple=1):
         self._paths = dataset_paths
         self.fields = fields
         self.batch_size = batch_size
         self.batch_size_fn = batch_size_fn
+        self.batch_size_multiple = batch_size_multiple
         self.device = device
         self.is_train = is_train
+        self.repeat = repeat
+        self.num_batches_multiple = num_batches_multiple
+
+    def _iter_dataset(self, path):
+        cur_dataset = torch.load(path)
+        logger.info('Loading dataset from %s, number of examples: %d' %
+                    (path, len(cur_dataset)))
+        cur_dataset.fields = self.fields
+        cur_iter = OrderedIterator(
+            dataset=cur_dataset,
+            batch_size=self.batch_size,
+            batch_size_multiple=self.batch_size_multiple,
+            batch_size_fn=self.batch_size_fn,
+            device=self.device,
+            train=self.is_train,
+            sort=False,
+            sort_within_batch=True,
+            repeat=False
+        )
+        for batch in cur_iter:
+            yield batch
+
+        cur_dataset.examples = None
+        gc.collect()
+        del cur_dataset
+        gc.collect()
 
     def __iter__(self):
-        paths = cycle(self._paths) if self.is_train else self._paths
+        num_batches = 0
+        paths = self._paths
+        if self.is_train and self.repeat:
+            # Cycle through the shards indefinitely.
+            paths = cycle(paths)
         for path in paths:
-            cur_dataset = torch.load(path)
-            logger.info('Loading dataset from %s, number of examples: %d' %
-                        (path, len(cur_dataset)))
-            cur_dataset.fields = self.fields
-            cur_iter = OrderedIterator(
-                dataset=cur_dataset,
-                batch_size=self.batch_size,
-                batch_size_fn=self.batch_size_fn,
-                device=self.device,
-                train=self.is_train,
-                sort=False,
-                sort_within_batch=True,
-                repeat=False
-            )
-            for batch in cur_iter:
+            for batch in self._iter_dataset(path):
                 yield batch
-
-            cur_dataset.examples = None
-            gc.collect()
-            del cur_dataset
-            gc.collect()
+                num_batches += 1
+        if self.is_train and not self.repeat and \
+           num_batches % self.num_batches_multiple != 0:
+            # When the dataset is not repeated, we might need to ensure that
+            # the number of returned batches is the multiple of a given value.
+            # This is important for multi GPU training to ensure that all
+            # workers have the same number of batches to process.
+            for path in paths:
+                for batch in self._iter_dataset(path):
+                    yield batch
+                    num_batches += 1
+                    if num_batches % self.num_batches_multiple == 0:
+                        return
 
 
 def max_tok_len(new, count, sofar):
@@ -584,8 +608,17 @@ def build_dataset_iter(corpus_type, fields, opt, is_train=True):
         return None
     batch_size = opt.batch_size if is_train else opt.valid_batch_size
     batch_fn = max_tok_len if is_train and opt.batch_type == "tokens" else None
+    batch_size_multiple = 8 if opt.model_dtype == "fp16" else 1
 
     device = "cuda" if opt.gpu_ranks else "cpu"
 
-    return DatasetLazyIter(dataset_paths, fields, batch_size, batch_fn,
-                           device, is_train)
+    return DatasetLazyIter(
+        dataset_paths,
+        fields,
+        batch_size,
+        batch_fn,
+        batch_size_multiple,
+        device,
+        is_train,
+        repeat=not opt.single_pass,
+        num_batches_multiple=opt.accum_count * opt.world_size)
