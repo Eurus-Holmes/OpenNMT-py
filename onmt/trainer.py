@@ -31,7 +31,8 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
             used to save the model
     """
-    tgt_field = fields['tgt'][0][1].base_field
+
+    tgt_field = dict(fields)["tgt"].base_field
     train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
     valid_loss = onmt.utils.loss.build_loss_compute(
         model, tgt_field, opt, train=False)
@@ -57,7 +58,8 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
                            gpu_verbose_level, report_manager,
                            model_saver=model_saver if gpu_rank == 0 else None,
                            average_decay=average_decay,
-                           average_every=average_every)
+                           average_every=average_every,
+                           model_dtype=opt.model_dtype)
     return trainer
 
 
@@ -90,7 +92,7 @@ class Trainer(object):
                  trunc_size=0, shard_size=32,
                  norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
                  gpu_verbose_level=0, report_manager=None, model_saver=None,
-                 average_decay=0, average_every=1):
+                 average_decay=0, average_every=1, model_dtype='fp32'):
         # Basic attributes.
         self.model = model
         self.train_loss = train_loss
@@ -108,6 +110,7 @@ class Trainer(object):
         self.average_decay = average_decay
         self.moving_average = None
         self.average_every = average_every
+        self.model_dtype = model_dtype
 
         assert grad_accum_count > 0
         if grad_accum_count > 1:
@@ -138,7 +141,7 @@ class Trainer(object):
 
     def _update_average(self, step):
         if self.moving_average is None:
-            copy_params = [params.detach()
+            copy_params = [params.detach().float()
                            for params in self.model.parameters()]
             self.moving_average = copy_params
         else:
@@ -148,7 +151,7 @@ class Trainer(object):
                                      self.model.parameters()):
                 self.moving_average[i] = \
                     (1 - average_decay) * avg + \
-                    average_decay * cpt.detach()
+                    cpt.detach().float() * average_decay
 
     def train(self,
               train_iter,
@@ -251,7 +254,8 @@ class Trainer(object):
             valid_model = deepcopy(self.model)
             for avg, param in zip(self.moving_average,
                                   valid_model.parameters()):
-                param.data = avg.data
+                param.data = avg.data.half() if self.model_dtype == "fp16" \
+                    else avg.data
         else:
             valid_model = self.model
 
