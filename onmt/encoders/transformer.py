@@ -7,6 +7,7 @@ import torch.nn as nn
 from onmt.encoders.encoder import EncoderBase
 from onmt.modules import MultiHeadedAttention
 from onmt.modules.position_ffn import PositionwiseFeedForward
+from onmt.utils.misc import sequence_mask
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -37,7 +38,7 @@ class TransformerEncoderLayer(nn.Module):
         """
         Args:
             inputs (FloatTensor): ``(batch_size, src_len, model_dim)``
-            mask (LongTensor): ``(batch_size, src_len, src_len)``
+            mask (LongTensor): ``(batch_size, 1, src_len)``
 
         Returns:
             (FloatTensor):
@@ -46,7 +47,7 @@ class TransformerEncoderLayer(nn.Module):
         """
         input_norm = self.layer_norm(inputs)
         context, _ = self.self_attn(input_norm, input_norm, input_norm,
-                                    mask=mask, type="self")
+                                    mask=mask, attn_type="self")
         out = self.dropout(context) + inputs
         return self.feed_forward(out)
 
@@ -118,10 +119,7 @@ class TransformerEncoder(EncoderBase):
         emb = self.embeddings(src)
 
         out = emb.transpose(0, 1).contiguous()
-        words = src[:, :, 0].transpose(0, 1)
-        w_batch, w_len = words.size()
-        padding_idx = self.embeddings.word_padding_idx
-        mask = words.data.eq(padding_idx).unsqueeze(1)  # [B, 1, T]
+        mask = ~sequence_mask(lengths).unsqueeze(1)
         # Run the forward pass of every layer of the tranformer.
         for layer in self.transformer:
             out = layer(out, mask)
