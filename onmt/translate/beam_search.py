@@ -1,7 +1,9 @@
 import torch
-
+from onmt.translate import penalties
 from onmt.translate.decode_strategy import DecodeStrategy
 from onmt.utils.misc import tile
+
+import warnings
 
 
 class BeamSearch(DecodeStrategy):
@@ -218,7 +220,7 @@ class BeamSearch(DecodeStrategy):
             cov_penalty = self.global_scorer.cov_penalty(
                 self._coverage,
                 beta=self.global_scorer.beta)
-            self.topk_scores -= cov_penalty.view(_B, self.beam_size)
+            self.topk_scores -= cov_penalty.view(_B, self.beam_size).float()
 
         self.is_finished = self.topk_ids.eq(self.eos)
         self.ensure_max_length()
@@ -238,11 +240,11 @@ class BeamSearch(DecodeStrategy):
                 step - 1, _B_old, self.beam_size, self.alive_attn.size(-1))
             if self.alive_attn is not None else None)
         non_finished_batch = []
-        for i in range(self.is_finished.size(0)):
+        for i in range(self.is_finished.size(0)):  # Batch level
             b = self._batch_offset[i]
             finished_hyp = self.is_finished[i].nonzero().view(-1)
             # Store finished hypotheses for this batch.
-            for j in finished_hyp:
+            for j in finished_hyp:  # Beam level: finished beam j in batch i
                 if self.ratio > 0:
                     s = self.topk_scores[i, j] / (step + 1)
                     if self.best_scores[b] < s:
@@ -268,7 +270,7 @@ class BeamSearch(DecodeStrategy):
                     if n >= self.n_best:
                         break
                     self.scores[b].append(score)
-                    self.predictions[b].append(pred)
+                    self.predictions[b].append(pred)  # ``(batch, n_best,)``
                     self.attention[b].append(
                         attn if attn is not None else [])
             else:
@@ -305,3 +307,68 @@ class BeamSearch(DecodeStrategy):
                 if self._stepwise_cov_pen:
                     self._prev_penalty = self._prev_penalty.index_select(
                         0, non_finished)
+
+
+class GNMTGlobalScorer(object):
+    """NMT re-ranking.
+
+    Args:
+       alpha (float): Length parameter.
+       beta (float):  Coverage parameter.
+       length_penalty (str): Length penalty strategy.
+       coverage_penalty (str): Coverage penalty strategy.
+
+    Attributes:
+        alpha (float): See above.
+        beta (float): See above.
+        length_penalty (callable): See :class:`penalties.PenaltyBuilder`.
+        coverage_penalty (callable): See :class:`penalties.PenaltyBuilder`.
+        has_cov_pen (bool): See :class:`penalties.PenaltyBuilder`.
+        has_len_pen (bool): See :class:`penalties.PenaltyBuilder`.
+    """
+
+    @classmethod
+    def from_opt(cls, opt):
+        return cls(
+            opt.alpha,
+            opt.beta,
+            opt.length_penalty,
+            opt.coverage_penalty)
+
+    def __init__(self, alpha, beta, length_penalty, coverage_penalty):
+        self._validate(alpha, beta, length_penalty, coverage_penalty)
+        self.alpha = alpha
+        self.beta = beta
+        penalty_builder = penalties.PenaltyBuilder(coverage_penalty,
+                                                   length_penalty)
+        self.has_cov_pen = penalty_builder.has_cov_pen
+        # Term will be subtracted from probability
+        self.cov_penalty = penalty_builder.coverage_penalty
+
+        self.has_len_pen = penalty_builder.has_len_pen
+        # Probability will be divided by this
+        self.length_penalty = penalty_builder.length_penalty
+
+    @classmethod
+    def _validate(cls, alpha, beta, length_penalty, coverage_penalty):
+        # these warnings indicate that either the alpha/beta
+        # forces a penalty to be a no-op, or a penalty is a no-op but
+        # the alpha/beta would suggest otherwise.
+        if length_penalty is None or length_penalty == "none":
+            if alpha != 0:
+                warnings.warn("Non-default `alpha` with no length penalty. "
+                              "`alpha` has no effect.")
+        else:
+            # using some length penalty
+            if length_penalty == "wu" and alpha == 0.:
+                warnings.warn("Using length penalty Wu with alpha==0 "
+                              "is equivalent to using length penalty none.")
+        if coverage_penalty is None or coverage_penalty == "none":
+            if beta != 0:
+                warnings.warn("Non-default `beta` with no coverage penalty. "
+                              "`beta` has no effect.")
+        else:
+            # using some coverage penalty
+            if beta == 0.:
+                warnings.warn("Non-default coverage penalty with beta==0 "
+                              "is equivalent to using coverage penalty none.")
